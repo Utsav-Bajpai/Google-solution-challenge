@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ISL — Indian Sign Language Recogniser</title>
+
+<!-- MediaPipe Hand Landmarker (runs fully in-browser via WASM) -->
+<script type="module">
+// ─────────────────────────────────────────────────────────────────────────────
+// We load MediaPipe from CDN so no npm/build step is needed.
+// The WASM files are also served by the CDN automatically.
+// ─────────────────────────────────────────────────────────────────────────────
+import {
+  HandLandmarker,
+  FilesetResolver,
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ── DOM refs ─────────────────────────────────────────────────────────────────
+const video        = document.getElementById("video");
+const overlay      = document.getElementById("overlay");
+const ctx          = overlay.getContext("2d");
+const statusDot    = document.getElementById("status-dot");
+const statusText   = document.getElementById("status-text");
+const predLabel    = document.getElementById("pred-label");
+const predConf     = document.getElementById("pred-conf");
+const top3List     = document.getElementById("top3-list");
+const sentenceEl   = document.getElementById("sentence");
+const holdBar      = document.getElementById("hold-bar");
+const holdFill     = document.getElementById("hold-fill");
+const holdLetter   = document.getElementById("hold-letter");
+const btnClear     = document.getElementById("btn-clear");
+const btnSpace     = document.getElementById("btn-space");
+const btnBackspace = document.getElementById("btn-backspace");
+const btnSpeak     = document.getElementById("btn-speak");
+const fpsEl        = document.getElementById("fps");
+const latencyEl    = document.getElementById("latency");
+
+// ── Connection constants ──────────────────────────────────────────────────────
+const CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17],
+];
+
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+const WS_PROTOCOL = location.protocol === "https:" ? "wss:" : "ws:";
+const WS_URL = `${WS_PROTOCOL}//${location.host}/ws`;
+let ws = null;
+let wsReady = false;
+let pendingResponse = false;   // back-pressure: one in-flight request at a time
+
+function connectWS() {
+  setStatus("connecting", "Connecting…");
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    wsReady = true;
+    setStatus("ok", "Connected");
+  };
+
+  ws.onmessage = (ev) => {
+    pendingResponse = false;
+    const msg = JSON.parse(ev.data);
+    handleServerMsg(msg);
+  };
+
+  ws.onerror = () => setStatus("error", "Connection error");
+
+  ws.onclose = () => {
+    wsReady = false;
+    setStatus("error", "Disconnected — retrying…");
+    setTimeout(connectWS, 2000);
+  };
+}
+
+function send(obj) {
+  if (wsReady && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
+}
+
+// ── MediaPipe setup ───────────────────────────────────────────────────────────
+let handLandmarker = null;
+let lastVideoTime  = -1;
+
+async function initMediaPipe() {
+  setStatus("connecting", "Loading MediaPipe…");
+
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      // Fetched from CDN — no local file needed.
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU",          // falls back to CPU automatically
+    },
+    runningMode:               "VIDEO",
+    numHands:                  2,
+    minHandDetectionConfidence: 0.5,
+    minHandPresenceConfidence:  0.5,
+    minTrackingConfidence:      0.5,
+  });
+
+  setStatus("ok", "MediaPipe ready");
+  startCamera();
+}
+
+// ── Camera ────────────────────────────────────────────────────────────────────
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: "user" },
+      audio: false,
+    });
+    video.srcObject = stream;
+    video.onloadedmetadata = () => {
+      video.play();
+      overlay.width  = video.videoWidth;
+      overlay.height = video.videoHeight;
+      requestAnimationFrame(processFrame);
+    };
+  } catch (e) {
+    setStatus("error", "Camera denied: " + e.message);
+  }
+}
+
+// ── Per-frame processing ──────────────────────────────────────────────────────
+let frameCount = 0;
+let fpsTimer   = performance.now();
+let noHandFrames = 0;
+const NO_HAND_REPORT_EVERY = 10;   // only tell backend every N no-hand frames
+
+function processFrame() {
+  requestAnimationFrame(processFrame);
+
+  if (!handLandmarker || video.readyState < 2) return;
+
+  const now = performance.now();
+  const tsMs = Math.round(now);
+
+  // MediaPipe needs monotonically increasing timestamps
+  if (video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+
+  // ── Run MediaPipe in-browser ───────────────────────────────
+  const result = handLandmarker.detectForVideo(video, tsMs);
+
+  // ── FPS counter ────────────────────────────────────────────
+  frameCount++;
+  if (now - fpsTimer >= 1000) {
+    fpsEl.textContent = `${frameCount} fps`;
+    frameCount = 0;
+    fpsTimer = now;
+  }
+
+  // ── Draw skeleton ──────────────────────────────────────────
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+  if (result.landmarks && result.landmarks.length > 0) {
+    noHandFrames = 0;
+    drawHands(result.landmarks);
+
+    // Only send if no response is pending (back-pressure)
+    if (!pendingResponse && wsReady) {
+      const coords = extractCoords(result.landmarks);
+      pendingResponse = true;
+      const t0 = performance.now();
+      // We patch the latency display when the response arrives
+      window._inferenceStart = t0;
+      send({ coords });
+    }
+  } else {
+    noHandFrames++;
+    // Tell backend periodically that no hand is visible
+    if (noHandFrames % NO_HAND_REPORT_EVERY === 1 && wsReady) {
+      send({ action: "no_hand" });
+    }
+    updateHoldBar(null, null);
+  }
+}
+
+// ── Feature extraction (mirrors backend Python logic) ────────────────────────
+function extractCoords(handsLandmarks) {
+  const coords = [];
+  for (let h = 0; h < 2; h++) {
+    if (h < handsLandmarks.length) {
+      const lms   = handsLandmarks[h];
+      const wrist = lms[0];
+      const raw   = [];
+      for (const lm of lms) {
+        raw.push(lm.x - wrist.x, lm.y - wrist.y, lm.z - wrist.z);
+      }
+      // Scale normalise by middle-finger-base (index 9 → flat idx 27,28)
+      const scale = Math.sqrt(raw[27] ** 2 + raw[28] ** 2);
+      const norm  = scale > 0 ? raw.map(v => v / scale) : raw;
+      coords.push(...norm);
+    } else {
+      coords.push(...new Array(63).fill(0));
+    }
+  }
+  return coords;   // 126 floats
+}
+
+// ── Draw hand skeleton on canvas ──────────────────────────────────────────────
+function drawHands(handsLandmarks) {
+  const W = overlay.width;
+  const H = overlay.height;
+
+  for (const lms of handsLandmarks) {
+    const pts = lms.map(lm => [lm.x * W, lm.y * H]);
+
+    ctx.strokeStyle = "#00ff50";
+    ctx.lineWidth   = 2;
+    for (const [a, b] of CONNECTIONS) {
+      ctx.beginPath();
+      ctx.moveTo(pts[a][0], pts[a][1]);
+      ctx.lineTo(pts[b][0], pts[b][1]);
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = "#00b4f5";
+    for (const [x, y] of pts) {
+      ctx.beginPath();
+      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+// ── Handle server messages ────────────────────────────────────────────────────
+function handleServerMsg(msg) {
+  // Latency display
+  if (window._inferenceStart) {
+    latencyEl.textContent = `${Math.round(performance.now() - window._inferenceStart)} ms`;
+    window._inferenceStart = null;
+  }
+
+  if (msg.type === "prediction") {
+    updatePrediction(msg);
+  } else {
+    // cleared / space / backspace / no_hand
+    sentenceEl.textContent = msg.sentence || "";
+  }
+}
+
+// ── UI update helpers ─────────────────────────────────────────────────────────
+let holdAnimFrame = null;
+let holdStart     = null;
+const HOLD_SECS   = 0.8;
+
+function updatePrediction(msg) {
+  sentenceEl.textContent = msg.sentence || "";
+
+  if (msg.best_label && msg.best_label !== "...") {
+    predLabel.textContent = msg.best_label;
+    predConf.textContent  = `${(msg.best_confidence * 100).toFixed(1)}%`;
+    predLabel.style.color = "#00ff87";
+    updateHoldBar(msg.best_label, msg.best_confidence);
+  } else {
+    predLabel.textContent = "—";
+    predConf.textContent  = "";
+    predLabel.style.color = "#555";
+    updateHoldBar(null, null);
+  }
+
+  // Top 3
+  top3List.innerHTML = "";
+  for (const [i, item] of (msg.top3 || []).entries()) {
+    const li = document.createElement("li");
+    li.innerHTML = `<span class="t3-label">${item.label}</span>
+                    <span class="t3-bar" style="width:${(item.conf*100).toFixed(0)}%"></span>
+                    <span class="t3-val">${(item.conf*100).toFixed(1)}%</span>`;
+    if (i === 0) li.classList.add("top");
+    top3List.appendChild(li);
+  }
+
+  if (msg.letter_recorded) {
+    flashLetter(msg.letter_recorded);
+  }
+}
+
+function updateHoldBar(letter, conf) {
+  if (!letter || conf < 0.5) {
+    holdBar.style.opacity = "0";
+    holdStart = null;
+    return;
+  }
+  holdBar.style.opacity = "1";
+  holdLetter.textContent = letter;
+  if (!holdStart) holdStart = performance.now();
+  const progress = Math.min((performance.now() - holdStart) / (HOLD_SECS * 1000), 1);
+  holdFill.style.width = `${progress * 100}%`;
+}
+
+function flashLetter(letter) {
+  const flash = document.createElement("div");
+  flash.className = "letter-flash";
+  flash.textContent = letter;
+  document.body.appendChild(flash);
+  setTimeout(() => flash.remove(), 800);
+  holdStart = null;
+}
+
+function setStatus(state, text) {
+  statusDot.className  = `dot dot-${state}`;
+  statusText.textContent = text;
+}
+
+// ── Controls ──────────────────────────────────────────────────────────────────
+btnClear.onclick     = () => send({ action: "clear" });
+btnSpace.onclick     = () => send({ action: "space" });
+btnBackspace.onclick = () => send({ action: "backspace" });
+
+btnSpeak.onclick = () => {
+  const text = sentenceEl.textContent.trim();
+  if (!text) return;
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.lang = "en-IN";
+  speechSynthesis.cancel();
+  speechSynthesis.speak(utt);
+  btnSpeak.classList.add("speaking");
+  utt.onend = () => btnSpeak.classList.remove("speaking");
+};
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+connectWS();
+initMediaPipe();
+</script>
+
+<style>
+/* ── Reset & base ────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #0a0c10;
+  --surface:  #12151c;
+  --border:   #1e2430;
+  --accent:   #00ff87;
+  --accent2:  #00b4f5;
+  --warn:     #ff6b35;
+  --text:     #e8eaf0;
+  --muted:    #555d70;
+  --radius:   12px;
+  --font-ui:  "DM Mono", "Courier New", monospace;
+  --font-disp:"Syne", sans-serif;
+}
+
+@import url("https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Mono:wght@400;500&display=swap");
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  grid-template-columns: 1fr;
+  overflow-x: hidden;
+}
+
+/* ── Noise grain overlay ─────────────────────────────────────────────────── */
+body::before {
+  content: "";
+  position: fixed; inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+  pointer-events: none; z-index: 9999; opacity: 0.35;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 28px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.logo {
+  font-family: var(--font-disp);
+  font-size: 1.4rem;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+}
+.logo span { color: var(--accent); }
+
+.status {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 0.8rem; color: var(--muted);
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; }
+.dot-ok         { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+.dot-error      { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+.dot-connecting { background: var(--accent2); animation: pulse 1s infinite; }
+
+@keyframes pulse { 50% { opacity: 0.3; } }
+
+.perf {
+  display: flex; gap: 16px;
+  font-size: 0.75rem; color: var(--muted);
+}
+.perf span { color: var(--accent2); }
+
+/* ── Main layout ─────────────────────────────────────────────────────────── */
+main {
+  display: grid;
+  grid-template-columns: 1fr 340px;
+  gap: 20px;
+  padding: 20px 28px;
+  max-width: 1280px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+/* ── Camera panel ────────────────────────────────────────────────────────── */
+.camera-wrap {
+  position: relative;
+  aspect-ratio: 4/3;
+  background: #000;
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+#video {
+  width: 100%; height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);   /* mirror */
+  display: block;
+}
+
+#overlay {
+  position: absolute; inset: 0;
+  transform: scaleX(-1);   /* mirror to match video */
+  pointer-events: none;
+}
+
+/* Hold-progress bar (overlaid bottom of camera) */
+.hold-bar-wrap {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  padding: 10px 16px 14px;
+  background: linear-gradient(transparent, rgba(0,0,0,0.7));
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+#hold-bar { opacity: 1; } /* controlled by JS */
+
+.hold-meta {
+  display: flex; justify-content: space-between;
+  font-size: 0.75rem; color: var(--muted); margin-bottom: 4px;
+}
+#hold-letter { font-size: 1.1rem; font-weight: 700; color: var(--accent2); }
+
+.bar-track {
+  height: 4px; background: rgba(255,255,255,0.1);
+  border-radius: 2px; overflow: hidden;
+}
+#hold-fill {
+  height: 100%; width: 0%;
+  background: var(--accent2);
+  border-radius: 2px;
+  transition: width 0.05s linear;
+}
+
+/* ── Side panel ──────────────────────────────────────────────────────────── */
+.side-panel {
+  display: flex; flex-direction: column; gap: 16px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+}
+
+.card-title {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+
+/* Prediction card */
+#pred-label {
+  font-family: var(--font-disp);
+  font-size: 5rem;
+  font-weight: 800;
+  line-height: 1;
+  color: var(--accent);
+  transition: color 0.2s;
+}
+#pred-conf {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+/* Top 3 */
+#top3-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+#top3-list li {
+  display: grid;
+  grid-template-columns: 36px 1fr 48px;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+}
+.t3-label { font-weight: 600; }
+.t3-bar {
+  height: 4px;
+  background: var(--accent2);
+  border-radius: 2px;
+  max-width: 100%;
+  transition: width 0.15s;
+}
+.t3-val { color: var(--muted); text-align: right; }
+#top3-list li.top .t3-label { color: var(--accent); }
+#top3-list li.top .t3-bar   { background: var(--accent); }
+
+/* Sentence card */
+.sentence-wrap {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+#sentence {
+  flex: 1;
+  font-size: 1.5rem;
+  font-family: var(--font-disp);
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  min-height: 2.5rem;
+  word-break: break-all;
+  color: var(--text);
+}
+#btn-speak {
+  background: none; border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 10px;
+  cursor: pointer; color: var(--muted);
+  font-size: 1.1rem; transition: all 0.2s;
+  flex-shrink: 0;
+}
+#btn-speak:hover   { border-color: var(--accent2); color: var(--accent2); }
+#btn-speak.speaking { border-color: var(--accent); color: var(--accent); animation: pulse 0.6s infinite; }
+
+/* Controls */
+.controls { display: flex; gap: 8px; }
+.btn {
+  flex: 1;
+  padding: 10px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 0.78rem;
+  cursor: pointer;
+  transition: all 0.15s;
+  letter-spacing: 0.5px;
+}
+.btn:hover            { border-color: var(--accent); color: var(--accent); }
+.btn.danger:hover     { border-color: var(--warn); color: var(--warn); }
+
+/* Letter flash ──────────────────────────────────────────────────────────── */
+.letter-flash {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%) scale(0.5);
+  font-family: var(--font-disp);
+  font-size: 8rem;
+  font-weight: 800;
+  color: var(--accent);
+  text-shadow: 0 0 40px var(--accent);
+  pointer-events: none;
+  z-index: 1000;
+  animation: letterPop 0.8s ease forwards;
+}
+@keyframes letterPop {
+  0%   { opacity: 0; transform: translate(-50%, -50%) scale(0.4); }
+  30%  { opacity: 1; transform: translate(-50%, -50%) scale(1.1); }
+  70%  { opacity: 1; transform: translate(-50%, -50%) scale(1.0); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.2); }
+}
+
+/* ── Footer ──────────────────────────────────────────────────────────────── */
+footer {
+  text-align: center;
+  padding: 14px;
+  font-size: 0.7rem;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+}
+
+/* ── Responsive ──────────────────────────────────────────────────────────── */
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; }
+  .side-panel { flex-direction: row; flex-wrap: wrap; }
+  .side-panel .card { flex: 1 1 45%; }
+}
+</style>
+</head>
+
+<body>
+<!-- ── Header ──────────────────────────────────────────────────────────────── -->
+<header>
+  <div class="logo">ISL<span>.</span>live</div>
+
+  <div class="status">
+    <div class="dot dot-connecting" id="status-dot"></div>
+    <span id="status-text">Initialising…</span>
+  </div>
+
+  <div class="perf">
+    <span id="fps">-- fps</span>
+    <span id="latency">-- ms</span>
+  </div>
+</header>
+
+<!-- ── Main ───────────────────────────────────────────────────────────────── -->
+<main>
+  <!-- Camera + skeleton overlay -->
+  <div class="camera-wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+
+    <!-- Hold progress (bottom of camera) -->
+    <div class="hold-bar-wrap">
+      <div id="hold-bar" style="opacity:0">
+        <div class="hold-meta">
+          <span>Holding</span>
+          <span id="hold-letter"></span>
+        </div>
+        <div class="bar-track"><div id="hold-fill"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Side panel -->
+  <div class="side-panel">
+
+    <!-- Current prediction -->
+    <div class="card">
+      <div class="card-title">Detected Sign</div>
+      <div id="pred-label">—</div>
+      <div id="pred-conf"></div>
+    </div>
+
+    <!-- Top 3 -->
+    <div class="card">
+      <div class="card-title">Top Predictions</div>
+      <ul id="top3-list"></ul>
+    </div>
+
+    <!-- Sentence -->
+    <div class="card">
+      <div class="card-title">Sentence</div>
+      <div class="sentence-wrap">
+        <div id="sentence"></div>
+        <button id="btn-speak" title="Speak sentence">🔊</button>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="card">
+      <div class="card-title">Controls</div>
+      <div class="controls">
+        <button class="btn" id="btn-space">Space</button>
+        <button class="btn" id="btn-backspace">⌫</button>
+        <button class="btn danger" id="btn-clear">Clear</button>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<footer>ISL Recognition · MediaPipe runs in-browser · Model inference on server · &lt;30 ms latency</footer>
+</body>
+</html>
