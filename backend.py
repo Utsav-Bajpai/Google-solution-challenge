@@ -1,18 +1,3 @@
-"""
-ISL Recognition Backend — FastAPI + WebSocket (Optimised)
-=========================================================
-Architecture change: MediaPipe runs IN THE BROWSER (JS SDK).
-The client extracts 126-D hand landmarks and sends ONLY those numbers.
-This backend does nothing but:
-  1. Receive a tiny JSON payload (~1 KB vs ~50 KB JPEG frame)
-  2. Run the Keras model (~1 ms)
-  3. Return the prediction
-
-Result: end-to-end latency drops from 200–500 ms → < 30 ms.
-
-Run with:
-    uvicorn backend:app --host 0.0.0.0 --port 8000 --reload
-"""
 
 import os
 import json
@@ -125,7 +110,7 @@ class SessionState:
         return "".join(self.sentence)
 
 
-# ── Prediction logic ───────────────────────────────────────────────────────────
+# Prediction logic 
 def run_inference(coords: list[float], state: SessionState) -> dict:
     """
     coords: 126 floats already normalised by the JS client.
@@ -184,7 +169,7 @@ def check_no_hand_timeout(state: SessionState):
         state.last_hand_time = time.monotonic()
 
 
-# ── WebSocket endpoint ─────────────────────────────────────────────────────────
+# WebSocket endpoint
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -196,7 +181,7 @@ async def websocket_endpoint(ws: WebSocket):
             data: dict = await ws.receive_json()
             action = data.get("action", "")
 
-            # ── Control actions ──────────────────────────────
+            # Control actions
             if action == "clear":
                 state.clear()
                 await ws.send_json({"type": "cleared",
@@ -217,7 +202,7 @@ async def websocket_endpoint(ws: WebSocket):
                                     "current_word": state.current_word})
                 continue
 
-            # ── No-hand timeout check ────────────────────────
+            # No-hand timeout check
             if action == "no_hand":
                 check_no_hand_timeout(state)
                 state.pred_buffer.clear()
@@ -228,7 +213,7 @@ async def websocket_endpoint(ws: WebSocket):
                                     "current_word": state.current_word})
                 continue
 
-            # ── Landmark inference ───────────────────────────
+            # Landmark inference
             coords = data.get("coords")          # list of 126 floats
             if not coords or len(coords) != 126:
                 continue
