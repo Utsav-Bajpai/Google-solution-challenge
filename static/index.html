@@ -604,6 +604,109 @@ footer {
   .side-panel { flex-direction: row; flex-wrap: wrap; }
   .side-panel .card { flex: 1 1 45%; }
 }
+
+/* ── Tablet / large mobile (≤ 768px) ────────────────────────────────────── */
+@media (max-width: 768px) {
+  header {
+    padding: 12px 16px;
+    gap: 10px;
+  }
+
+  .logo { font-size: 1.15rem; }
+
+  .perf { gap: 10px; font-size: 0.7rem; }
+
+  main {
+    padding: 14px 16px;
+    gap: 14px;
+  }
+
+  /* Slightly shorter camera so the panel is visible without scrolling */
+  .camera-wrap { aspect-ratio: 16/10; }
+
+  .side-panel { gap: 12px; }
+
+  .card { padding: 14px; }
+
+  .card-title {
+    font-size: 0.6rem;
+    margin-bottom: 10px;
+  }
+
+  #pred-label { font-size: 4rem; }
+
+  #sentence { font-size: 1.25rem; }
+
+  .btn { padding: 10px 0; font-size: 0.75rem; }
+}
+
+/* ── Small mobile (≤ 480px) ─────────────────────────────────────────────── */
+@media (max-width: 480px) {
+  header {
+    padding: 10px 12px;
+    gap: 8px;
+  }
+
+  .logo { font-size: 1rem; }
+
+  .status { font-size: 0.72rem; gap: 6px; }
+
+  .perf { gap: 8px; font-size: 0.68rem; }
+
+  main {
+    padding: 12px 12px;
+    gap: 10px;
+  }
+
+  /* Compact camera — still visible but not dominating */
+  .camera-wrap { aspect-ratio: 4/3; max-height: 52vw; }
+
+  /* Stack all cards in a single column */
+  .side-panel {
+    flex-direction: column;
+    gap: 10px;
+  }
+  .side-panel .card { flex: 1 1 100%; }
+
+  .card { padding: 12px; }
+
+  .card-title {
+    font-size: 0.58rem;
+    letter-spacing: 1.5px;
+    margin-bottom: 8px;
+  }
+
+  /* Smaller prediction label */
+  #pred-label { font-size: 3rem; }
+
+  #pred-conf { font-size: 0.78rem; }
+
+  #sentence {
+    font-size: 1.1rem;
+    min-height: 2rem;
+  }
+
+  /* Larger tap targets for buttons */
+  .btn {
+    min-height: 44px;
+    padding: 0;
+    font-size: 0.75rem;
+  }
+
+  #btn-speak {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.2rem;
+  }
+
+  .controls { gap: 6px; }
+
+  footer { font-size: 0.62rem; padding: 10px 12px; }
+}
 </style>
 </head>
 
